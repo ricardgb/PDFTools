@@ -1,0 +1,7 @@
+bin/
+obj/
+nupkg/
+*.user
+.DS_Store
+# native binaries land here from the CI artifact; never committed
+runtimes/

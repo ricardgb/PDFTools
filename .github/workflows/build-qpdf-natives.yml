@@ -1,0 +1,455 @@
+name: Build qpdf Natives
+
+# Builds the native qpdf shared library from source for every RID that
+# Tideway.PdfTools bundles as runtimes/{rid}/native assets:
+#
+#   runtimes/win-x64/native/qpdf.dll
+#   runtimes/linux-x64/native/libqpdf.so
+#   runtimes/linux-arm64/native/libqpdf.so
+#   runtimes/osx-x64/native/libqpdf.dylib
+#   runtimes/osx-arm64/native/libqpdf.dylib
+#
+# zlib and libjpeg-turbo are built from source as static (-fPIC) libraries and
+# folded into the shared libqpdf, so each binary's only dynamic dependencies
+# are OS-default libraries (libc/libstdc++/libm on Linux, /usr/lib + /System
+# on macOS, KERNEL32-and-friends on Windows). Every matrix job asserts this
+# with readelf/otool/dumpbin, and — where the host can execute the binary —
+# smoke-tests the real Tideway.PdfTools wrapper against the fresh build
+# on every leg (all five build natively on their own runner arch).
+#
+# Nothing is pushed to a feed and nothing is committed: the run produces a
+# combined `qpdf-runtimes` artifact (drop into runtimes/) plus
+# a ready-packed Tideway.PdfTools .nupkg artifact.
+on:
+  workflow_dispatch:
+    inputs:
+      qpdf_version:
+        description: 'qpdf release tag to build (github.com/qpdf/qpdf, format vX.Y.Z)'
+        required: true
+        default: 'v12.3.2'
+
+permissions:
+  contents: read
+
+env:
+  ZLIB_VERSION: '1.3.1'
+  LIBJPEG_TURBO_VERSION: '3.1.4'
+  # macOS 11 (Big Sur) floor: oldest macOS supported by current .NET, and old
+  # enough for any osx-x64/osx-arm64 machine that can run this package.
+  MACOSX_DEPLOYMENT_TARGET: '11.0'
+
+jobs:
+  build:
+    name: Build ${{ matrix.rid }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      QPDF_VERSION: ${{ inputs.qpdf_version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rid: win-x64
+            os: windows-2022
+          # ubuntu-22.04 (glibc 2.35) rather than -latest: binaries link against
+          # the build host's glibc symbol versions, so building on the oldest
+          # supported runner keeps the .so loadable on Ubuntu 22.04+, Debian 12+,
+          # RHEL 9+ and the .NET runtime-deps container images.
+          - rid: linux-x64
+            os: ubuntu-22.04
+          # linux-arm64 builds natively on GitHub's ARM runner (free for
+          # public repos), so it gets the execution smoke test like every
+          # other leg.
+          - rid: linux-arm64
+            os: ubuntu-22.04-arm
+          # macOS: one native runner per architecture (macos-13 = Intel,
+          # macos-14 = Apple Silicon) instead of a single CMAKE_OSX_ARCHITECTURES
+          # universal build, so BOTH slices get the execution smoke test.
+          - rid: osx-x64
+            os: macos-13
+          - rid: osx-arm64
+            os: macos-14
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 10.0
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      # nasm: assembler for libjpeg-turbo's x86-64 SIMD code (arm64 uses NEON
+      # intrinsics and needs no assembler, but installing it is harmless).
+      - name: Install build prerequisites (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nasm
+
+      - name: Install build prerequisites (macOS x64)
+        if: matrix.rid == 'osx-x64'
+        run: brew install nasm
+
+      - name: Install build prerequisites (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install nasm -y --no-progress
+          Add-Content $env:GITHUB_PATH 'C:\Program Files\NASM'
+
+      - name: Download qpdf, zlib and libjpeg-turbo sources
+        shell: bash
+        run: |
+          curl -fsSLo zlib.tar.gz "https://github.com/madler/zlib/releases/download/v${ZLIB_VERSION}/zlib-${ZLIB_VERSION}.tar.gz"
+          curl -fsSLo libjpeg-turbo.tar.gz "https://github.com/libjpeg-turbo/libjpeg-turbo/archive/refs/tags/${LIBJPEG_TURBO_VERSION}.tar.gz"
+          curl -fsSLo qpdf.tar.gz "https://github.com/qpdf/qpdf/archive/refs/tags/${QPDF_VERSION}.tar.gz"
+          tar xzf zlib.tar.gz
+          tar xzf libjpeg-turbo.tar.gz
+          tar xzf qpdf.tar.gz
+          mv "qpdf-${QPDF_VERSION#v}" qpdf-src
+
+      - name: Build static deps + shared libqpdf (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          PREFIX="$GITHUB_WORKSPACE/deps"
+          INSTALL="$GITHUB_WORKSPACE/qpdf-install"
+
+          # --- zlib: static only, -fPIC so it can be folded into libqpdf.so ---
+          cmake -S "zlib-$ZLIB_VERSION" -B build-zlib \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+            -DCMAKE_INSTALL_LIBDIR=lib \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DZLIB_BUILD_EXAMPLES=OFF \
+            
+          cmake --build build-zlib --parallel
+          cmake --install build-zlib
+          # zlib's CMake always builds shared AND static; delete the shared one
+          # so CMake's FindZLIB can only ever resolve our static libz.a.
+          rm -f "$PREFIX"/lib/libz.so* "$PREFIX"/lib/libz*.dylib
+
+          # --- libjpeg-turbo: static only, -fPIC, no TurboJPEG API needed ---
+          cmake -S "libjpeg-turbo-$LIBJPEG_TURBO_VERSION" -B build-jpeg \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+            -DCMAKE_INSTALL_LIBDIR=lib \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DENABLE_SHARED=OFF \
+            -DENABLE_STATIC=ON \
+            -DWITH_TURBOJPEG=OFF \
+            
+          cmake --build build-jpeg --parallel
+          cmake --install build-jpeg
+
+          # --- qpdf: shared library with the vendored native crypto provider ---
+          # REQUIRE_CRYPTO_NATIVE=1 + USE_IMPLICIT_CRYPTO=0 (names verified
+          # against qpdf's installation docs): build ONLY qpdf's internal
+          # crypto, never picking up OpenSSL/GnuTLS from the build host.
+          # JPEG_LIBRARY/JPEG_INCLUDE_DIR pinned explicitly so FindJPEG cannot
+          # drift to a host-installed (wrong-arch, dynamic) libjpeg.
+          cmake -S qpdf-src -B build-qpdf \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$INSTALL" \
+            -DCMAKE_INSTALL_LIBDIR=lib \
+            -DBUILD_SHARED_LIBS=ON \
+            -DBUILD_STATIC_LIBS=OFF \
+            -DREQUIRE_CRYPTO_NATIVE=1 \
+            -DUSE_IMPLICIT_CRYPTO=0 \
+            -DBUILD_TESTING=OFF \
+            -DBUILD_DOC=OFF \
+            -DINSTALL_EXAMPLES=OFF \
+            -DCMAKE_PREFIX_PATH="$PREFIX" \
+            -DZLIB_ROOT="$PREFIX" \
+            -DJPEG_LIBRARY="$PREFIX/lib/libjpeg.a" \
+            -DJPEG_INCLUDE_DIR="$PREFIX/include" \
+            
+          cmake --build build-qpdf --parallel
+          cmake --install build-qpdf
+
+      - name: Build static deps + shared qpdf.dll (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $prefix  = Join-Path $env:GITHUB_WORKSPACE 'deps'
+          $install = Join-Path $env:GITHUB_WORKSPACE 'qpdf-install'
+
+          # /MT (static CRT) for every object that ends up in qpdf.dll, so the
+          # DLL ships without vcruntime/msvcp/ucrtbase DLL dependencies and we
+          # don't have to redistribute the VC runtime alongside it.
+          # CMP0091=NEW makes older CMakeLists (zlib) honour the setting.
+          $msvc = @('-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded', '-DCMAKE_POLICY_DEFAULT_CMP0091=NEW')
+
+          # --- zlib: static only ---
+          cmake -S "zlib-$env:ZLIB_VERSION" -B build-zlib -A x64 `
+            -DCMAKE_INSTALL_PREFIX="$prefix" -DZLIB_BUILD_EXAMPLES=OFF @msvc
+          cmake --build build-zlib --config Release --parallel
+          cmake --install build-zlib --config Release
+          # Delete the shared zlib + its import lib so FindZLIB can only
+          # resolve zlibstatic.lib.
+          Remove-Item -Force -ErrorAction SilentlyContinue "$prefix\bin\*.dll", "$prefix\lib\zlib.lib"
+
+          # --- libjpeg-turbo: static only ---
+          cmake -S "libjpeg-turbo-$env:LIBJPEG_TURBO_VERSION" -B build-jpeg -A x64 `
+            -DCMAKE_INSTALL_PREFIX="$prefix" -DENABLE_SHARED=OFF -DENABLE_STATIC=ON -DWITH_TURBOJPEG=OFF @msvc
+          cmake --build build-jpeg --config Release --parallel
+          cmake --install build-jpeg --config Release
+
+          # --- qpdf: shared DLL, native crypto (see Unix step for flag notes) ---
+          cmake -S qpdf-src -B build-qpdf -A x64 `
+            -DCMAKE_INSTALL_PREFIX="$install" `
+            -DBUILD_SHARED_LIBS=ON -DBUILD_STATIC_LIBS=OFF `
+            -DREQUIRE_CRYPTO_NATIVE=1 -DUSE_IMPLICIT_CRYPTO=0 `
+            -DBUILD_TESTING=OFF -DBUILD_DOC=OFF -DINSTALL_EXAMPLES=OFF `
+            -DCMAKE_PREFIX_PATH="$prefix" -DZLIB_ROOT="$prefix" `
+            -DJPEG_LIBRARY="$prefix\lib\jpeg-static.lib" -DJPEG_INCLUDE_DIR="$prefix\include" `
+            @msvc
+          cmake --build build-qpdf --config Release --parallel
+          cmake --install build-qpdf --config Release
+
+      - name: Collect library + license (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir artifact
+          # The install tree has the real file under a versioned soname
+          # (libqpdf.so.30.x.y / libqpdf.30.x.y.dylib) plus symlinks; -type f
+          # picks the real file, which must ship under the exact name the
+          # .NET DllImport resolver probes first.
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            LIB=$(find qpdf-install -name 'libqpdf*.dylib' -type f | head -n1)
+            OUT=libqpdf.dylib
+          else
+            LIB=$(find qpdf-install -name 'libqpdf.so*' -type f | head -n1)
+            OUT=libqpdf.so
+          fi
+          test -n "$LIB"
+          cp "$LIB" "artifact/$OUT"
+          cp qpdf-src/LICENSE.txt artifact/qpdf.LICENSE.txt
+          echo "QPDF_BUILT_LIBRARY=$GITHUB_WORKSPACE/artifact/$OUT" >> "$GITHUB_ENV"
+
+      - name: Collect library + license (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # qpdf's DLL is versioned (e.g. qpdf30.dll); the DllImport name is
+          # plain "qpdf", so rename it. LoadLibrary doesn't care about the
+          # original filename, unlike ELF sonames.
+          $dll = Get-ChildItem "$env:GITHUB_WORKSPACE\qpdf-install" -Recurse -Filter 'qpdf*.dll' | Select-Object -First 1
+          if (-not $dll) { throw 'no qpdf*.dll found in install tree' }
+          New-Item -ItemType Directory -Force artifact | Out-Null
+          Copy-Item $dll.FullName artifact\qpdf.dll
+          Copy-Item qpdf-src\LICENSE.txt artifact\qpdf.LICENSE.txt
+          Add-Content $env:GITHUB_ENV "QPDF_BUILT_LIBRARY=$env:GITHUB_WORKSPACE\artifact\qpdf.dll"
+
+      - name: Verify dynamic dependencies (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          EXPECT_ARCH=x86-64
+          if [[ "${{ matrix.rid }}" == "linux-arm64" ]]; then EXPECT_ARCH=aarch64; fi
+          file artifact/libqpdf.so
+          file artifact/libqpdf.so | grep -q "$EXPECT_ARCH" || { echo "::error::wrong architecture (expected $EXPECT_ARCH)"; exit 1; }
+          echo "NEEDED entries:"
+          readelf -d artifact/libqpdf.so | grep NEEDED
+          # Allowed: glibc pieces + libstdc++/libgcc_s (the .NET runtime itself
+          # requires libstdc++, so it is present wherever this package runs).
+          # A leaked libjpeg.so/libz.so — i.e. static linking failed — fails here.
+          BAD=$(readelf -d artifact/libqpdf.so | grep NEEDED | grep -vE '\[(libstdc\+\+\.so|libm\.so|libgcc_s\.so|libc\.so|ld-linux-)' || true)
+          if [[ -n "$BAD" ]]; then
+            echo "::error::unexpected dynamic dependencies:"
+            echo "$BAD"
+            exit 1
+          fi
+          echo "Dependency check OK"
+
+      - name: Verify dynamic dependencies (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          if [[ "${{ matrix.rid }}" == "osx-arm64" ]]; then EXPECT_ARCH=arm64; else EXPECT_ARCH=x86_64; fi
+          lipo -info artifact/libqpdf.dylib
+          lipo -info artifact/libqpdf.dylib | grep -q "$EXPECT_ARCH" || { echo "::error::wrong architecture (expected $EXPECT_ARCH)"; exit 1; }
+          otool -L artifact/libqpdf.dylib
+          # otool -L line 1 is the file name, line 2 the dylib's own
+          # LC_ID_DYLIB install-name; real dependencies start at line 3 and
+          # must all be OS libraries (/usr/lib or /System).
+          BAD=$(otool -L artifact/libqpdf.dylib | tail -n +3 | awk '{print $1}' | grep -vE '^(/usr/lib/|/System/)' || true)
+          if [[ -n "$BAD" ]]; then
+            echo "::error::unexpected dynamic dependencies:"
+            echo "$BAD"
+            exit 1
+          fi
+          echo "Dependency check OK"
+
+      - name: Verify dynamic dependencies (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $dumpbin = Get-ChildItem -Recurse -Path (Join-Path $vs 'VC\Tools\MSVC') -Filter dumpbin.exe |
+                     Where-Object { $_.FullName -match 'Hostx64\\x64' } |
+                     Select-Object -First 1 -ExpandProperty FullName
+          $out = & $dumpbin /dependents artifact\qpdf.dll
+          $out | Write-Host
+          $deps = $out | Where-Object { $_ -match '^\s+\S+\.dll\s*$' } | ForEach-Object { $_.Trim() }
+          # OS-default DLLs only. vcruntime/msvcp/ucrtbase (=> /MT didn't stick)
+          # or jpeg/zlib DLLs (=> static linking failed) fail the allowlist.
+          $bad = @($deps | Where-Object { $_ -notmatch '(?i)^(KERNEL32|ADVAPI32|USER32|BCRYPT|CRYPT32|ntdll|api-ms-win-)' })
+          if ($bad.Count) {
+            Write-Host "::error::unexpected dynamic dependencies: $($bad -join ', ')"
+            exit 1
+          }
+          Write-Host "Dependency check OK: $($deps -join ', ')"
+
+      # Real-wrapper smoke test: build Tideway.PdfTools from this checkout and
+      # exercise PageCount + Merge against the freshly built native library
+      # (QPDF_LIBRARY_PATH overrides all other probing in the resolver).
+      - name: Smoke-test Tideway.PdfTools against the built library
+        shell: bash
+        env:
+          QPDF_LIBRARY_PATH: ${{ env.QPDF_BUILT_LIBRARY }}
+        run: |
+          dotnet build PDFTools.csproj -c Release
+
+          mkdir smoke
+          cat > smoke/smoke.csproj <<'EOF'
+          <Project Sdk="Microsoft.NET.Sdk">
+            <PropertyGroup>
+              <OutputType>Exe</OutputType>
+              <TargetFramework>net10.0</TargetFramework>
+              <Nullable>enable</Nullable>
+            </PropertyGroup>
+            <ItemGroup>
+              <ProjectReference Include="../PDFTools.csproj" />
+            </ItemGroup>
+          </Project>
+          EOF
+          cat > smoke/Program.cs <<'EOF'
+          using System.Text;
+          using Tideway.PdfTools;
+
+          Console.WriteLine($"qpdf library under test: {Environment.GetEnvironmentVariable(Qpdf.LibraryPathEnvironmentVariable)}");
+
+          byte[] a = MinimalPdf();
+          byte[] b = MinimalPdf();
+
+          int one = PdfTools.PageCount(a);
+          Console.WriteLine($"PageCount(single) = {one}");
+          if (one != 1) throw new Exception($"PageCount expected 1, got {one}");
+
+          byte[] merged = PdfTools.Merge(a, b);
+          int two = PdfTools.PageCount(merged);
+          Console.WriteLine($"PageCount(merged) = {two}");
+          if (two != 2) throw new Exception($"PageCount of merged PDF expected 2, got {two}");
+
+          Console.WriteLine("Smoke test PASSED");
+
+          // Minimal valid one-page PDF, built with computed xref offsets
+          // (all-ASCII, so StringBuilder length == byte offset).
+          static byte[] MinimalPdf()
+          {
+              var sb = new StringBuilder("%PDF-1.4\n");
+              var offsets = new List<int>();
+              void Obj(string body) { offsets.Add(sb.Length); sb.Append(body); }
+              Obj("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+              Obj("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+              Obj("3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n");
+              int xref = sb.Length;
+              sb.Append("xref\n0 4\n0000000000 65535 f \n");
+              foreach (int o in offsets) sb.Append($"{o:D10} 00000 n \n");
+              sb.Append($"trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n");
+              return Encoding.ASCII.GetBytes(sb.ToString());
+          }
+          EOF
+          dotnet run --project smoke -c Release
+
+      - name: Upload native artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: qpdf-${{ matrix.rid }}
+          path: artifact/
+          if-no-files-found: error
+          overwrite: true   # keeps job re-runs from failing on the existing artifact
+
+  # Lay every platform build out in the NuGet runtimes/ structure, publish it
+  # as one combined artifact, and prove the package packs correctly with the
+  # binaries in place. Artifacts only — no feed push, no git commit.
+  assemble:
+    name: Assemble runtimes + pack
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 10.0
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Download native artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: qpdf-*
+          path: staging
+
+      - name: Lay out runtimes/ structure
+        run: |
+          set -euo pipefail
+          copy() {
+            local rid="$1" lib="$2"
+            mkdir -p "runtimes/$rid/native"
+            cp "staging/qpdf-$rid/$lib" "runtimes/$rid/native/$lib"
+          }
+          copy win-x64     qpdf.dll
+          copy linux-x64   libqpdf.so
+          copy linux-arm64 libqpdf.so
+          copy osx-x64     libqpdf.dylib
+          copy osx-arm64   libqpdf.dylib
+          # qpdf is Apache-2.0; ship its license with the redistributed binaries.
+          cp staging/qpdf-linux-x64/qpdf.LICENSE.txt runtimes/qpdf.LICENSE.txt
+          echo "Assembled layout:"
+          find runtimes -type f | sort
+
+      # Extract this artifact into runtimes/ to pack locally.
+      - name: Upload combined runtimes artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: qpdf-runtimes
+          path: runtimes
+          if-no-files-found: error
+          overwrite: true
+
+      - name: Pack Tideway.PdfTools with bundled natives
+        run: dotnet pack PDFTools.csproj -c Release -o nupkg
+
+      - name: Verify nupkg contains every native asset
+        run: |
+          set -euo pipefail
+          PKG=$(ls nupkg/Tideway.PdfTools.*.nupkg)
+          unzip -l "$PKG"
+          for p in \
+              runtimes/win-x64/native/qpdf.dll \
+              runtimes/linux-x64/native/libqpdf.so \
+              runtimes/linux-arm64/native/libqpdf.so \
+              runtimes/osx-x64/native/libqpdf.dylib \
+              runtimes/osx-arm64/native/libqpdf.dylib \
+              runtimes/qpdf.LICENSE.txt; do
+            unzip -l "$PKG" | grep -q "$p" || { echo "::error::$p missing from $PKG"; exit 1; }
+          done
+          echo "Package contents OK"
+
+      - name: Upload nupkg artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tideway-pdftools-nupkg
+          path: nupkg/*.nupkg
+          if-no-files-found: error
+          overwrite: true
