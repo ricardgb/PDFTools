@@ -200,6 +200,13 @@ jobs:
           # CMP0091=NEW makes older CMakeLists (zlib) honour the setting.
           $msvc = @('-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded', '-DCMAKE_POLICY_DEFAULT_CMP0091=NEW')
 
+          # qpdf upstream assumes an /MD build and puts /NODEFAULTLIB:LIBCMT on
+          # the DLL link to silence /MT-vs-/MD mixing warnings — which breaks
+          # a real /MT build with unresolved _purecall (the static CRT gets
+          # excluded). Flip it to block the DYNAMIC CRT instead: unblocks /MT
+          # and makes any stray /MD object fail loudly.
+          (Get-Content qpdf-src\libqpdf\CMakeLists.txt) -replace '/NODEFAULTLIB:LIBCMT /NODEFAULTLIB:LIBCMTD', '/NODEFAULTLIB:MSVCRT /NODEFAULTLIB:MSVCRTD' | Set-Content qpdf-src\libqpdf\CMakeLists.txt
+
           # --- zlib: static only ---
           cmake -S "zlib-$env:ZLIB_VERSION" -B build-zlib -A x64 `
             -DCMAKE_INSTALL_PREFIX="$prefix" -DZLIB_BUILD_EXAMPLES=OFF @msvc
