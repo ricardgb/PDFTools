@@ -71,8 +71,13 @@ jobs:
             os: macos-14
 
     steps:
+      # Checked out into repo/ so the dependency source trees extracted at the
+      # workspace root (zlib ships C# sample code in contrib/dotzlib) can never
+      # be swept into the root-level csproj by the SDK's default compile globs.
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          path: repo
 
       - name: Setup .NET 10.0
         uses: actions/setup-dotnet@v4
@@ -316,7 +321,7 @@ jobs:
         env:
           QPDF_LIBRARY_PATH: ${{ env.QPDF_BUILT_LIBRARY }}
         run: |
-          dotnet build PDFTools.csproj -c Release
+          dotnet build repo/PDFTools.csproj -c Release
 
           mkdir smoke
           cat > smoke/smoke.csproj <<'EOF'
@@ -327,7 +332,7 @@ jobs:
               <Nullable>enable</Nullable>
             </PropertyGroup>
             <ItemGroup>
-              <ProjectReference Include="../PDFTools.csproj" />
+              <ProjectReference Include="../repo/PDFTools.csproj" />
             </ItemGroup>
           </Project>
           EOF
