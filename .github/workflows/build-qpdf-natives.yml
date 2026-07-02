@@ -27,6 +27,11 @@ on:
         description: 'qpdf release tag to build (github.com/qpdf/qpdf, format vX.Y.Z)'
         required: true
         default: 'v12.3.2'
+      publish_to_nuget:
+        description: 'Push the packed nupkg to nuget.org (Trusted Publishing)'
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -459,3 +464,40 @@ jobs:
           path: nupkg/*.nupkg
           if-no-files-found: error
           overwrite: true
+
+  # Publishes the exact nupkg that assemble packed and verified. Opt-in via
+  # the publish_to_nuget input. Auth is nuget.org Trusted Publishing: the
+  # workflow's OIDC token is exchanged for a short-lived API key — no stored
+  # secret. Requires (one-time, on nuget.org):
+  #   Account -> Trusted Publishing -> add policy for this repository and
+  #   this workflow file (build-qpdf-natives.yml)
+  # and the NUGET_USER repository variable set to the nuget.org username that
+  # owns the policy.
+  publish:
+    name: Publish to nuget.org
+    needs: assemble
+    if: ${{ inputs.publish_to_nuget }}
+    runs-on: ubuntu-22.04
+    permissions:
+      id-token: write   # OIDC token for the Trusted Publishing exchange
+      contents: read
+    steps:
+      - name: Setup .NET 10.0
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Download nupkg artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tideway-pdftools-nupkg
+          path: nupkg
+
+      - name: NuGet login (Trusted Publishing)
+        id: login
+        uses: NuGet/login@v1
+        with:
+          user: ${{ vars.NUGET_USER }}
+
+      - name: Push to nuget.org
+        run: dotnet nuget push nupkg/*.nupkg --api-key ${{ steps.login.outputs.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json --skip-duplicate
