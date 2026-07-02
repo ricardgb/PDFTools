@@ -158,8 +158,13 @@ jobs:
           # REQUIRE_CRYPTO_NATIVE=1 + USE_IMPLICIT_CRYPTO=0 (names verified
           # against qpdf's installation docs): build ONLY qpdf's internal
           # crypto, never picking up OpenSSL/GnuTLS from the build host.
-          # JPEG_LIBRARY/JPEG_INCLUDE_DIR pinned explicitly so FindJPEG cannot
-          # drift to a host-installed (wrong-arch, dynamic) libjpeg.
+          # qpdf does NOT use CMake's FindZLIB/FindJPEG: it tries pkg-config
+          # (which finds our static deps because FindPkgConfig prepends
+          # CMAKE_PREFIX_PATH to the .pc search path), else falls back to its
+          # own find_path/find_library into the ZLIB_H_PATH/ZLIB_LIB_PATH/
+          # LIBJPEG_H_PATH/LIBJPEG_LIB_PATH cache variables. Pre-seeding those
+          # pins the fallback to our static builds so it can never drift to a
+          # host library.
           cmake -S qpdf-src -B build-qpdf \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX="$INSTALL" \
@@ -172,9 +177,10 @@ jobs:
             -DBUILD_DOC=OFF \
             -DINSTALL_EXAMPLES=OFF \
             -DCMAKE_PREFIX_PATH="$PREFIX" \
-            -DZLIB_ROOT="$PREFIX" \
-            -DJPEG_LIBRARY="$PREFIX/lib/libjpeg.a" \
-            -DJPEG_INCLUDE_DIR="$PREFIX/include" \
+            -DZLIB_H_PATH="$PREFIX/include" \
+            -DZLIB_LIB_PATH="$PREFIX/lib/libz.a" \
+            -DLIBJPEG_H_PATH="$PREFIX/include" \
+            -DLIBJPEG_LIB_PATH="$PREFIX/lib/libjpeg.a" \
             
           cmake --build build-qpdf --parallel
           cmake --install build-qpdf
@@ -215,8 +221,9 @@ jobs:
             -DBUILD_SHARED_LIBS=ON -DBUILD_STATIC_LIBS=OFF `
             -DREQUIRE_CRYPTO_NATIVE=1 -DUSE_IMPLICIT_CRYPTO=0 `
             -DBUILD_TESTING=OFF -DBUILD_DOC=OFF -DINSTALL_EXAMPLES=OFF `
-            -DCMAKE_PREFIX_PATH="$prefix" -DZLIB_ROOT="$prefix" `
-            -DJPEG_LIBRARY="$prefix\lib\jpeg-static.lib" -DJPEG_INCLUDE_DIR="$prefix\include" `
+            -DCMAKE_PREFIX_PATH="$prefix" `
+            -DZLIB_H_PATH="$prefix\include" -DZLIB_LIB_PATH="$prefix\lib\zlibstatic.lib" `
+            -DLIBJPEG_H_PATH="$prefix\include" -DLIBJPEG_LIB_PATH="$prefix\lib\jpeg-static.lib" `
             @msvc
           cmake --build build-qpdf --config Release --parallel
           cmake --install build-qpdf --config Release
